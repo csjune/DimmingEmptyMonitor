@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod windows_theme;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -17,18 +19,14 @@ use windows::Win32::Devices::Display::{
     PHYSICAL_MONITOR, SetMonitorBrightness,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE,
-    HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD,
-    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW,
-};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
@@ -48,18 +46,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND,
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
     GetClassNameW, GetCursorPos, GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, HWND_BROADCAST,
-    IDI_APPLICATION, IMAGE_ICON, IsIconic, IsWindowVisible, KillTimer, LR_DEFAULTSIZE, LoadIconW,
-    LoadImageW, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-    MessageBoxW, OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SW_HIDE, SendMessageTimeoutW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, IDI_APPLICATION,
+    IMAGE_ICON, IsIconic, IsWindowVisible, KillTimer, LR_DEFAULTSIZE, LoadIconW, LoadImageW,
+    MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
+    OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SW_HIDE, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NCCREATE, WM_NULL,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{BOOL, Error, PCSTR, PCWSTR, PWSTR, w};
+use windows::core::{BOOL, Error, PCWSTR, PWSTR, w};
+
+use windows_theme::{WindowsTheme, enable_native_dark_menus, refresh_native_menu_theme};
 
 const APP_NAME: &str = "MMD";
 const CLASS_NAME: PCWSTR = w!("MmdRustWindow");
@@ -88,7 +87,6 @@ static EVENT_TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static EVENT_COUNT: AtomicI64 = AtomicI64::new(0);
 static LAST_EVENT: OnceLock<Mutex<Option<LastEvent>>> = OnceLock::new();
 static TASKBAR_CREATED_MESSAGE: OnceLock<u32> = OnceLock::new();
-static UXTHEME_MODULE: OnceLock<isize> = OnceLock::new();
 
 fn main() -> windows::core::Result<()> {
     let Some(_single_instance) = SingleInstanceGuard::acquire()? else {
@@ -319,179 +317,6 @@ enum AppAction {
     None,
     Exit,
     ShowDiagnostics(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowsTheme {
-    Light,
-    Dark,
-}
-
-impl WindowsTheme {
-    fn toggled(self) -> Self {
-        match self {
-            Self::Light => Self::Dark,
-            Self::Dark => Self::Light,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
-    fn toggle_label(self) -> &'static str {
-        match self {
-            Self::Light => "Windows Dark Mode",
-            Self::Dark => "Windows Light Mode",
-        }
-    }
-
-    fn read() -> Result<Self, String> {
-        let mut value = 1u32;
-        let mut value_size = size_of::<u32>() as u32;
-        let result = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                w!("SystemUsesLightTheme"),
-                RRF_RT_REG_DWORD,
-                None,
-                Some(addr_of_mut!(value).cast()),
-                Some(&mut value_size),
-            )
-        };
-
-        if result == ERROR_SUCCESS {
-            Ok(if value == 0 { Self::Dark } else { Self::Light })
-        } else if result == ERROR_FILE_NOT_FOUND {
-            Ok(Self::Light)
-        } else {
-            Err(format!(
-                "Failed to read Windows theme setting (error {})",
-                result.0
-            ))
-        }
-    }
-
-    fn apply(self) -> Result<(), String> {
-        let mut key = HKEY::default();
-        let result = unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                None,
-                PCWSTR::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
-                None,
-                &mut key,
-                None,
-            )
-        };
-        if result != ERROR_SUCCESS {
-            return Err(format!(
-                "Failed to open Windows theme settings (error {})",
-                result.0
-            ));
-        }
-
-        let value = u32::from(self == Self::Light).to_ne_bytes();
-        let system_result = unsafe {
-            RegSetValueExW(
-                key,
-                w!("SystemUsesLightTheme"),
-                None,
-                REG_DWORD,
-                Some(&value),
-            )
-        };
-        let apps_result =
-            unsafe { RegSetValueExW(key, w!("AppsUseLightTheme"), None, REG_DWORD, Some(&value)) };
-        unsafe {
-            let _ = RegCloseKey(key);
-        }
-
-        if system_result != ERROR_SUCCESS {
-            return Err(format!(
-                "Failed to change Windows theme setting (error {})",
-                system_result.0
-            ));
-        }
-        if apps_result != ERROR_SUCCESS {
-            return Err(format!(
-                "Failed to change Windows app theme setting (error {})",
-                apps_result.0
-            ));
-        }
-
-        let setting_name = wide_null("ImmersiveColorSet");
-        let mut broadcast_result = 0usize;
-        unsafe {
-            let _ = SendMessageTimeoutW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                WPARAM(0),
-                LPARAM(setting_name.as_ptr() as isize),
-                SMTO_ABORTIFHUNG,
-                250,
-                Some(&mut broadcast_result),
-            );
-        }
-
-        Ok(())
-    }
-}
-
-fn enable_native_dark_menus() {
-    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
-    type FlushMenuThemes = unsafe extern "system" fn();
-
-    unsafe {
-        let Some(library) = uxtheme_module() else {
-            return;
-        };
-
-        if let Some(set_preferred_app_mode) = GetProcAddress(library, PCSTR(135usize as *const u8))
-        {
-            let set_preferred_app_mode: SetPreferredAppMode =
-                std::mem::transmute(set_preferred_app_mode);
-            const PREFERRED_APP_MODE_ALLOW_DARK: i32 = 1;
-            let _ = set_preferred_app_mode(PREFERRED_APP_MODE_ALLOW_DARK);
-        }
-
-        if let Some(flush_menu_themes) = GetProcAddress(library, PCSTR(136usize as *const u8)) {
-            let flush_menu_themes: FlushMenuThemes = std::mem::transmute(flush_menu_themes);
-            flush_menu_themes();
-        }
-    }
-}
-
-fn refresh_native_menu_theme() {
-    type FlushMenuThemes = unsafe extern "system" fn();
-
-    unsafe {
-        let Some(library) = uxtheme_module() else {
-            return;
-        };
-
-        if let Some(flush_menu_themes) = GetProcAddress(library, PCSTR(136usize as *const u8)) {
-            let flush_menu_themes: FlushMenuThemes = std::mem::transmute(flush_menu_themes);
-            flush_menu_themes();
-        }
-    }
-}
-
-fn uxtheme_module() -> Option<HMODULE> {
-    if let Some(handle) = UXTHEME_MODULE.get() {
-        return Some(HMODULE(*handle as *mut c_void));
-    }
-
-    let library = unsafe { LoadLibraryW(w!("uxtheme.dll")) }.ok()?;
-    let _ = UXTHEME_MODULE.set(library.0 as isize);
-    Some(library)
 }
 
 fn dispatch_command(hwnd: HWND, state: &RefCell<AppState>, command_id: usize) {
@@ -2376,12 +2201,6 @@ mod tests {
                 next_state: DisplayDimmingState::Lit,
             }
         );
-    }
-
-    #[test]
-    fn windows_theme_toggle_label_names_the_target_mode() {
-        assert_eq!(WindowsTheme::Light.toggle_label(), "Windows Dark Mode");
-        assert_eq!(WindowsTheme::Dark.toggle_label(), "Windows Light Mode");
     }
 
     #[test]
